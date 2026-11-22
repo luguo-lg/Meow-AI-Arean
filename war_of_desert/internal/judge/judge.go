@@ -30,6 +30,14 @@ import (
 // ErrTimeout 表示 Bot 在预算内没有交出完整一行。
 var ErrTimeout = errors.New("decision timeout")
 
+// ErrLineTooLong 表示 Bot 单行输出超过协议上限（protocol.MaxLine）。
+var ErrLineTooLong = errors.New("line too long")
+
+type lineMsg struct {
+	text string
+	err  error
+}
+
 // BotSpec 是一个已编译的选手程序。
 type BotSpec struct {
 	Name string
@@ -98,7 +106,7 @@ type botProc struct {
 	spec  BotSpec
 	cmd   *exec.Cmd
 	stdin io.WriteCloser
-	lines chan string
+	lines chan lineMsg
 	done  chan struct{}
 	stop  sync.Once
 	errMu sync.Mutex
@@ -153,7 +161,7 @@ func startBot(spec BotSpec, hello string, initMs int, env []string) (*botProc, e
 		os.RemoveAll(workDir)
 		return nil, err
 	}
-	p := &botProc{spec: spec, cmd: cmd, stdin: stdin, lines: make(chan string, 4), done: make(chan struct{}), workDir: workDir}
+	p := &botProc{spec: spec, cmd: cmd, stdin: stdin, lines: make(chan lineMsg, 4), done: make(chan struct{}), workDir: workDir}
 	cmd.Stderr = &limitedWriter{buf: &p.err, max: 4096}
 	if err := cmd.Start(); err != nil {
 		os.RemoveAll(workDir)
@@ -189,20 +197,44 @@ func startBot(spec BotSpec, hello string, initMs int, env []string) (*botProc, e
 	return p, nil
 }
 
+// readBoundedLine 最多读取 max 字节（不含行尾 \r\n）的一行。
+// 超过上限时立即返回 ErrLineTooLong，避免异常输出耗尽裁判内存或撑爆引擎宿主。
+func readBoundedLine(br *bufio.Reader, max int) (string, error) {
+	slice, err := br.ReadSlice('\n')
+	if errors.Is(err, bufio.ErrBufferFull) {
+		return "", ErrLineTooLong
+	}
+	if err != nil && !errors.Is(err, io.EOF) {
+		return "", err
+	}
+	if len(slice) == 0 {
+		return "", io.EOF
+	}
+	line := bytes.TrimSuffix(slice, []byte("\n"))
+	line = bytes.TrimSuffix(line, []byte("\r"))
+	if len(line) > max {
+		return "", ErrLineTooLong
+	}
+	return string(line), nil
+}
+
 func (p *botProc) readLoop(r io.Reader) {
 	defer close(p.lines)
-	br := bufio.NewReaderSize(r, 1<<20)
+	br := bufio.NewReaderSize(r, protocol.MaxLine+2)
 	for {
-		line, err := br.ReadString('\n')
-		if len(line) > 0 {
-			line = strings.TrimRight(line, "\r\n")
-			select {
-			case p.lines <- line:
-			case <-p.done:
-				return
-			}
-		}
+		line, err := readBoundedLine(br, protocol.MaxLine)
 		if err != nil {
+			if !errors.Is(err, io.EOF) {
+				select {
+				case p.lines <- lineMsg{err: err}:
+				case <-p.done:
+				}
+			}
+			return
+		}
+		select {
+		case p.lines <- lineMsg{text: line}:
+		case <-p.done:
 			return
 		}
 	}
@@ -228,11 +260,11 @@ func (p *botProc) readLine(d time.Duration) (string, error) {
 	timer := time.NewTimer(d)
 	defer timer.Stop()
 	select {
-	case line, ok := <-p.lines:
+	case msg, ok := <-p.lines:
 		if !ok {
 			return "", io.EOF
 		}
-		return line, nil
+		return msg.text, msg.err
 	case <-timer.C:
 		return "", ErrTimeout
 	}
@@ -553,6 +585,9 @@ func runGame(host *engine.Host, gi int, swap bool, seed int, seats []string, spe
 func faultKind(err error) string {
 	if errors.Is(err, ErrTimeout) {
 		return "timeout"
+	}
+	if errors.Is(err, ErrLineTooLong) {
+		return "line_too_long"
 	}
 	if errors.Is(err, io.EOF) {
 		return "crash"

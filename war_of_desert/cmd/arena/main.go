@@ -76,7 +76,7 @@ func usage() {
   arena build  [-config tournament/formal_v14.json]
   arena plan   [-config tournament/formal_v14.json]
 	arena run    [-config tournament/formal_v14.json] [-resume] [-limit N]
-	arena rate   [-config tournament/formal_v14.json]
+	arena rate   [-config tournament/formal_v14.json] [-partial]
   arena check  [-a <bot.exe>] [-b <bot.exe>] [-seed N] [-config ...]
   arena local  [-bot bot.exe] [-vs a.exe,b.exe] [-seeds N] [-out 目录]
                选手本地调试：与基线对打，出逐局 VP + 回放（不校验封存）
@@ -350,8 +350,9 @@ func cmdRun(args []string) error {
 		return err
 	}
 	// 开赛硬门槛：源码哈希必须与封存记录一致，否则赛后无法自证跑的是收卷那份代码。
+	var seal *contest.Seal
 	if !*skipSeal {
-		seal, err := contest.LoadSeal(root, cfg.Key)
+		seal, err = contest.LoadSeal(root, cfg.Key)
 		if err != nil {
 			return err
 		}
@@ -373,17 +374,21 @@ func cmdRun(args []string) error {
 	if err != nil {
 		return fmt.Errorf("读不到冻结赛程（先跑 arena plan）: %w", err)
 	}
+	runRules, err := resolveRunRules(plan, cfg)
+	if err != nil {
+		return err
+	}
 	// 冻结赛程必须与当前引擎同一套规则；否则 seed 与规则指纹都会对不上。
-	wantHash := sim.RulesHashFor(cfg.Rules.Ruleset, cfg.Rules.TickLimit, sim.NormalizeVision(sim.Vision{
-		Enabled: cfg.Rules.Vision, Fog: cfg.Rules.Vision, LOS: cfg.Rules.Vision,
+	wantHash := sim.RulesHashFor(runRules.Ruleset, runRules.TickLimit, sim.NormalizeVision(sim.Vision{
+		Enabled: runRules.Vision, Fog: runRules.Vision, LOS: runRules.Vision,
 	}))
 	if plan.RulesHash != "" && plan.RulesHash != wantHash {
 		return fmt.Errorf("冻结赛程 rulesHash=%s 与当前引擎 rulesHash=%s 不一致（规则已变，先重新 arena plan）",
 			plan.RulesHash, wantHash)
 	}
-	byName := map[string]schedule.Entry{}
-	for _, e := range plan.Entries {
-		byName[e.Name] = e
+	binByName, err := resolveRunBins(root, cfg, plan, seal)
+	if err != nil {
+		return err
 	}
 	resultsPath := filepath.Join(outDir, "结果.jsonl")
 	done := map[int]bool{}
@@ -414,7 +419,11 @@ func cmdRun(args []string) error {
 				}
 				seen[l.Match][l.Game] = true
 			}
+			scanErr := sc.Err()
 			f.Close()
+			if scanErr != nil {
+				return fmt.Errorf("读取结果.jsonl 失败: %w", scanErr)
+			}
 			// 一场必须换边两局（Mirror=true）且复核通过才算完成；只写了一局就崩溃、
 			// 或复核失败的场次，旧逻辑会整场跳过，这里改为丢弃残余行后重跑。
 			want := 1
@@ -481,15 +490,7 @@ func cmdRun(args []string) error {
 	}
 	judgeCfg := judge.Config{
 		HostScript: hostScript,
-		Rules: engine.HostConfig{
-			Generator: cfg.Rules.Generator,
-			TickLimit: cfg.Rules.TickLimit,
-			TickMs:    cfg.Rules.TickMs,
-			DecideMs:  cfg.Rules.DecideMs,
-			InitMs:    cfg.Rules.InitMs,
-			Vision:    cfg.Rules.Vision,
-			Ruleset:   cfg.Rules.Ruleset,
-		},
+		Rules:      runRules,
 		Mirror:     plan.Mirror,
 		MaxStrikes: plan.Config.MaxStrikes,
 		StrikeMode: plan.Config.StrikeMode,
@@ -506,16 +507,16 @@ func cmdRun(args []string) error {
 		if *limit > 0 && ran >= *limit {
 			break
 		}
-		ea, ok := byName[m.A]
+		binA, ok := binByName[m.A]
 		if !ok {
 			return fmt.Errorf("赛程里的选手 %s 不在 entries 中", m.A)
 		}
-		eb, ok := byName[m.B]
+		binB, ok := binByName[m.B]
 		if !ok {
 			return fmt.Errorf("赛程里的选手 %s 不在 entries 中", m.B)
 		}
-		specA := judge.BotSpec{Name: ea.Name, Path: binPath(root, ea.Bin)}
-		specB := judge.BotSpec{Name: eb.Name, Path: binPath(root, eb.Bin)}
+		specA := judge.BotSpec{Name: m.A, Path: binA}
+		specB := judge.BotSpec{Name: m.B, Path: binB}
 		rec, err := judge.RunMatch(m.ID, m.Seed, specA, specB, judgeCfg)
 		if err != nil {
 			return fmt.Errorf("第 %d 场（%s vs %s）失败: %w", m.ID, m.A, m.B, err)
@@ -614,6 +615,7 @@ type standing struct {
 func cmdRate(args []string) error {
 	fs := flag.NewFlagSet("rate", flag.ExitOnError)
 	cfgPath := fs.String("config", "tournament/formal_v14.json", "赛事配置")
+	partial := fs.Bool("partial", false, "允许赛中不完整结果（输出 临时成绩.md，不覆盖正式成绩）")
 	_ = fs.Parse(args)
 
 	cfg, root, err := contest.Load(*cfgPath)
@@ -631,6 +633,9 @@ func cmdRate(args []string) error {
 	wantHash := sim.RulesHashFor(cfg.Rules.Ruleset, cfg.Rules.TickLimit, sim.NormalizeVision(sim.Vision{
 		Enabled: cfg.Rules.Vision, Fog: cfg.Rules.Vision, LOS: cfg.Rules.Vision,
 	}))
+	if plan.RulesHash != "" && plan.RulesHash != wantHash {
+		return fmt.Errorf("冻结赛程 rulesHash=%s 与当前引擎 rulesHash=%s 不一致，拒绝评分", plan.RulesHash, wantHash)
+	}
 	f, err := os.Open(filepath.Join(outDir, "结果.jsonl"))
 	if err != nil {
 		return err
@@ -657,8 +662,15 @@ func cmdRate(args []string) error {
 		}
 		lines = append(lines, l)
 	}
+	if err := sc.Err(); err != nil {
+		return fmt.Errorf("读取结果.jsonl 失败: %w", err)
+	}
 	if len(lines) == 0 {
 		return fmt.Errorf("结果.jsonl 为空，先跑 arena run")
+	}
+	expectedGames, err := validateResultsAgainstPlan(plan, lines, *partial)
+	if err != nil {
+		return err
 	}
 
 	// 计分域数从结果行推导（v1.0 八领域 / v1.1 七领域），标签不再硬编码。
@@ -725,10 +737,17 @@ func cmdRate(args []string) error {
 		}
 	}
 
+	jsonName, mdName, totalName := "成绩.json", "成绩.md", "成绩_加权总分.md"
+	titleKind := "正式赛成绩"
+	if *partial && len(lines) < expectedGames {
+		jsonName, mdName, totalName = "临时成绩.json", "临时成绩.md", "临时成绩_加权总分.md"
+		titleKind = fmt.Sprintf("临时成绩（未完赛 %d/%d 局）", len(lines), expectedGames)
+	}
+
 	anchor := plan.Entries[0].Name
 	bt := rating.Fit(btGames, anchor, cfg.Bootstrap(), 20261109)
 	rawBT, _ := json.MarshalIndent(bt, "", "  ")
-	if err := os.WriteFile(filepath.Join(outDir, "成绩.json"), append(rawBT, '\n'), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(outDir, jsonName), append(rawBT, '\n'), 0o644); err != nil {
 		return err
 	}
 
@@ -756,7 +775,7 @@ func cmdRate(args []string) error {
 	})
 
 	var b strings.Builder
-	fmt.Fprintf(&b, "# %s · 正式赛成绩\n\n", cfg.Name)
+	fmt.Fprintf(&b, "# %s · %s\n\n", cfg.Name, titleKind)
 	fmt.Fprintf(&b, "> 赛季：%s ｜ 规则 %s ｜ 引擎 %s ｜ 规则指纹：%s ｜ 局数：%d（无效 %d） ｜ 基准 seed：%v（逐场按序递增）\n",
 		cfg.Season, versionOr(plan.RulesVersion), valueOr(plan.Engine, cfg.Engine.Kind), lines[0].RulesHash, len(lines), invalidGames, cfg.Schedule.Seeds)
 	fmt.Fprintf(&b, "> 评分口径：%s；%s。\n\n", bt.Method, bt.Scale)
@@ -772,7 +791,7 @@ func cmdRate(args []string) error {
 	fmt.Fprintf(&b, "\n基准锚：%s = 0；有效 %d 局（排除无效 %d）；bootstrap %d 次。\n", bt.Anchor, bt.Games, invalidGames, bt.Bootstrap)
 	fmt.Fprintf(&b, "\n> 胜负标签与%s加权总分是两条独立信号：本表按胜负拟合实力值，加权总分单列。\n", domainLabel)
 	fmt.Fprintf(&b, "> 区间按对局整块重抽样；全胜/全败时区间会退化，属统计口径而非成绩异常。\n")
-	if err := os.WriteFile(filepath.Join(outDir, "成绩.md"), []byte(b.String()), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(outDir, mdName), []byte(b.String()), 0o644); err != nil {
 		return err
 	}
 
@@ -790,13 +809,13 @@ func cmdRate(args []string) error {
 		}
 		fmt.Fprintf(&t, "| %d | %s | %.1f | %.2f | %d |\n", i+1, s.Name, s.Total, avg, s.Faults)
 	}
-	if err := os.WriteFile(filepath.Join(outDir, "成绩_加权总分.md"), []byte(t.String()), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(outDir, totalName), []byte(t.String()), 0o644); err != nil {
 		return err
 	}
 
-	fmt.Printf("rate → %s\n", filepath.Join(outDir, "成绩.md"))
-	fmt.Printf("       %s\n", filepath.Join(outDir, "成绩_加权总分.md"))
-	fmt.Printf("       %s\n", filepath.Join(outDir, "成绩.json"))
+	fmt.Printf("rate → %s\n", filepath.Join(outDir, mdName))
+	fmt.Printf("       %s\n", filepath.Join(outDir, totalName))
+	fmt.Printf("       %s\n", filepath.Join(outDir, jsonName))
 	return nil
 }
 
